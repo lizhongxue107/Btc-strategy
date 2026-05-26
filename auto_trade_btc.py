@@ -221,11 +221,12 @@ class BTCAutoTrader:
         self.paper_mode = paper_mode
         self.bet = bet
         self.pr_rate = pr_rate
-        self.notifier = notifier  # Telegram通知器
+        self.notifier = notifier  # 飞书通知器
         self.symbol = "BTCUSDT"
         self.interval = "1m"
+        self.start_time = datetime.now()
 
-        # 冷却 (跟Pine Script逻辑一致: bar index计数)
+        # 冷却
         self.cooldown_5 = 0
         self.cooldown_10 = 0
         self.cool5_bars = 10
@@ -239,6 +240,13 @@ class BTCAutoTrader:
         # 运行控制
         self.running = False
         self.last_bar_time = None
+
+        # 自检
+        self.last_heartbeat = time.time()
+        self.heartbeat_interval = 3600  # 1小时
+        self.consecutive_errors = 0
+        self.last_error_alert = 0
+        self.was_disconnected = False
 
         # 统计
         self.stats_lock = threading.Lock()
@@ -420,6 +428,53 @@ class BTCAutoTrader:
         print(f"  ── 统计: {wins}胜/{losses}败 胜率{wr:.1f}% 盈亏{total_pnl:+.1f}U "
               f"挂单中:{len(pending)}")
 
+    def check_heartbeat(self):
+        """定时心跳: 每小时发一次运行状态到飞书"""
+        now = time.time()
+        if now - self.last_heartbeat < self.heartbeat_interval:
+            return
+        self.last_heartbeat = now
+
+        settled = [t for t in self.trades if t.is_settled]
+        pending = [t for t in self.trades if not t.is_settled]
+        wins = sum(1 for t in settled if t.status == OrderStatus.WON)
+        losses = len(settled) - wins
+        total_pnl = sum(t.pnl for t in settled)
+        uptime_h = (datetime.now() - self.start_time).total_seconds() / 3600
+        wr = wins / len(settled) * 100 if settled else 0
+
+        msg = (
+            f"💚 运行正常 | 已运行{uptime_h:.1f}h\n"
+            f"交易: {len(settled)}单 | 胜率: {wr:.1f}%\n"
+            f"盈亏: {total_pnl:+.1f}U | 挂单: {len(pending)}"
+        )
+        print(f"[心跳] {msg}")
+        if self.notifier:
+            self.notifier.send(msg)
+
+    def alert_error(self, err_msg: str):
+        """连接异常时发飞书告警"""
+        now = time.time()
+        if now - self.last_error_alert < 300:  # 5分钟内不重复告警
+            return
+        self.last_error_alert = now
+        self.was_disconnected = True
+
+        msg = f"⚠️ 连接异常\n{err_msg}"
+        print(f"[告警] {msg}")
+        if self.notifier:
+            self.notifier.send(msg)
+
+    def alert_recovered(self):
+        """连接恢复通知"""
+        if not self.was_disconnected:
+            return
+        self.was_disconnected = False
+        msg = "✅ 连接已恢复, 正常运行中"
+        print(f"[恢复] {msg}")
+        if self.notifier:
+            self.notifier.send(msg)
+
     def print_summary(self):
         """打印完整统计"""
         settled = [t for t in self.trades if t.is_settled]
@@ -463,7 +518,6 @@ def main_loop(bot: BTCAutoTrader, interval_sec=1):
     print(f"[主循环] 每{interval_sec}秒检查一次...")
     bot.running = True
 
-    consecutive_errors = 0
     processed_bars = set()
 
     # 启动时先处理已有的数据
@@ -482,15 +536,26 @@ def main_loop(bot: BTCAutoTrader, interval_sec=1):
         while bot.running:
             time.sleep(interval_sec)
 
+            # 心跳
+            bot.check_heartbeat()
+
             df = fetch_recent_klines(symbol=bot.symbol, interval=bot.interval, limit=200)
             if df is None:
-                consecutive_errors += 1
-                if consecutive_errors > 10:
-                    print(f"[错误] 连续{consecutive_errors}次获取失败, 等待60秒...")
-                    time.sleep(60)
+                bot.consecutive_errors += 1
+                if bot.consecutive_errors == 1:
+                    bot.alert_error("无法连接币安API, 正在重试...")
+                elif bot.consecutive_errors >= 30:
+                    if bot.consecutive_errors % 30 == 0:  # 每30次(30秒)提醒一次
+                        bot.alert_error(f"已断连 {bot.consecutive_errors} 秒")
+                time.sleep(5)
                 continue
 
-            consecutive_errors = 0
+            # 连接恢复
+            if bot.consecutive_errors > 0:
+                bot.consecutive_errors = 0
+                bot.alert_recovered()
+            else:
+                bot.consecutive_errors = 0
 
             # 检查是否有新K线
             latest_bar = df.index[-1]
