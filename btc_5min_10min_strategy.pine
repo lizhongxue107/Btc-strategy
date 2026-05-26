@@ -1,0 +1,187 @@
+//@version=5
+indicator("BTC 5min/10min 趋势回踩策略 v6.2", overlay=true)
+
+// ========== 参数 ==========
+cool5 = input.int(10, "5min冷却(1minK线)")
+cool10 = input.int(20, "10min冷却(1minK线)")
+bet = input.float(50, "每注金额(U)")
+pr_rate = input.float(80, "猜对收益率(%)")
+
+bars_th = input.int(3, "回踩深度(根K线)", minval=1, maxval=5)
+rsi_buy_max = input.int(55, "做多RSI上限", minval=30, maxval=70)
+rsi_sell_min = input.int(45, "做空RSI下限", minval=30, maxval=70)
+vol_min = input.float(1.2, "最小成交量倍数", minval=0.5, maxval=3.0)
+use_macd_filter = input.bool(true, "MACD柱对齐过滤")
+
+// ========== 基础指标 ==========
+ema8 = ta.ema(close, 8)
+ema21 = ta.ema(close, 21)
+ema50 = ta.ema(close, 50)
+
+rsi = ta.rsi(close, 14)
+rsi_6 = ta.rsi(close, 6)
+
+[macd, macd_sig, macd_hist] = ta.macd(close, 12, 26, 9)
+
+atr = ta.atr(14)
+
+vol_ma20 = ta.sma(volume, 20)
+
+// ========== 多时间框架趋势 ==========
+bull_5min = request.security(syminfo.tickerid, "5", close > ta.ema(close, 8), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+bear_5min = not bull_5min
+bull_15min = request.security(syminfo.tickerid, "15", close > ta.ema(close, 21), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+bear_15min = not bull_15min
+
+// ========== 趋势方向(EMA斜率) ==========
+trend_up = ema8 > ema21 and ema8 > ema8[1]
+trend_dn = ema8 < ema21 and ema8 < ema8[1]
+
+// ========== 信号组件 ==========
+// 核心思路: 不回踩不进, 等价格回踩EMA8后确认反弹再进
+
+// 回踩深度: 最近3根K线至少N根低于EMA8
+bars_below = (close[1] < ema8[1] ? 1 : 0) + (close[2] < ema8[2] ? 1 : 0) + (close[3] < ema8[3] ? 1 : 0)
+bars_above = (close[1] > ema8[1] ? 1 : 0) + (close[2] > ema8[2] ? 1 : 0) + (close[3] > ema8[3] ? 1 : 0)
+
+// MACD柱对齐
+macd_aligned_buy = use_macd_filter ? macd_hist > macd_hist[1] : true
+macd_aligned_sell = use_macd_filter ? macd_hist < macd_hist[1] : true
+
+// 多头: 上升趋势 + 价格回踩EMA8下方 + 收回EMA8上方 + 放量反弹
+pullback_buy = trend_up and bars_below >= bars_th and close > ema8 and close > open and volume > vol_ma20 * vol_min and rsi > rsi[1] and rsi < rsi_buy_max and macd_aligned_buy
+
+// 空头: 下降趋势 + 价格反弹到EMA8上方 + 跌破EMA8 + 放量下跌
+bounce_sell = trend_dn and bars_above >= bars_th and close < ema8 and close < open and volume > vol_ma20 * vol_min and rsi < rsi[1] and rsi > rsi_sell_min and macd_aligned_sell
+
+// ========== 冷却系统 ==========
+var int c5 = 0
+var int c10 = 0
+
+buy5 = pullback_buy and bull_5min and c5 == 0
+sell5 = bounce_sell and bear_5min and c5 == 0
+buy10 = pullback_buy and bull_5min and bull_15min and c10 == 0
+sell10 = bounce_sell and bear_5min and bear_15min and c10 == 0
+
+if buy5 or sell5
+    c5 := cool5
+else
+    c5 := math.max(0, c5 - 1)
+if buy10 or sell10
+    c10 := cool10
+else
+    c10 := math.max(0, c10 - 1)
+
+// ========== 图表 ==========
+plot(ema8, "EMA8", color=color.orange, linewidth=2)
+plot(ema21, "EMA21", color=color.blue, linewidth=1)
+plot(ema50, "EMA50", color=color.gray, linewidth=1)
+
+bgcolor(trend_up ? color.new(color.green, 97) : trend_dn ? color.new(color.red, 97) : na)
+
+plotshape(buy5, "5min涨", shape.triangleup, location.belowbar, color=color.green, size=size.tiny, text="5min涨")
+plotshape(sell5, "5min跌", shape.triangledown, location.abovebar, color=color.red, size=size.tiny, text="5min跌")
+plotshape(buy10, "10min涨", shape.labelup, location.belowbar, color=color.rgb(0, 85, 255), size=size.small, text="10min涨")
+plotshape(sell10, "10min跌", shape.labeldown, location.abovebar, color=color.rgb(204, 0, 255), size=size.small, text="10min跌")
+
+// ========== 5min结算 ==========
+var int b5 = na
+var float p5 = na
+var string d5 = na
+var int w5 = 0
+var int l5 = 0
+
+if not na(b5) and bar_index - b5 >= 5
+    if (d5 == "up" and close > p5) or (d5 == "dn" and close < p5)
+        w5 += 1
+    else
+        l5 += 1
+    b5 := na
+    p5 := na
+    d5 := na
+
+if buy5 and na(b5)
+    b5 := bar_index
+    p5 := close
+    d5 := "up"
+if sell5 and na(b5)
+    b5 := bar_index
+    p5 := close
+    d5 := "dn"
+
+// ========== 10min结算 ==========
+var int b10 = na
+var float p10 = na
+var string d10 = na
+var int w10 = 0
+var int l10 = 0
+
+if not na(b10) and bar_index - b10 >= 10
+    if (d10 == "up" and close > p10) or (d10 == "dn" and close < p10)
+        w10 += 1
+    else
+        l10 += 1
+    b10 := na
+    p10 := na
+    d10 := na
+
+if buy10 and na(b10)
+    b10 := bar_index
+    p10 := close
+    d10 := "up"
+if sell10 and na(b10)
+    b10 := bar_index
+    p10 := close
+    d10 := "dn"
+
+// ========== 统计表 ==========
+var t = table.new(position.bottom_right, 7, 5, border_width=1, border_color=color.white)
+if barstate.islast
+    t5 = w5 + l5
+    t10 = w10 + l10
+    wr5 = t5 > 0 ? math.round(w5 / t5 * 100, 1) : 0
+    wr10 = t10 > 0 ? math.round(w10 / t10 * 100, 1) : 0
+    n5 = w5 * (bet * pr_rate / 100) - l5 * bet
+    n10 = w10 * (bet * pr_rate / 100) - l10 * bet
+    total_pnl = n5 + n10
+
+    table.cell(t, 0, 0, "", text_color=color.white, bgcolor=color.rgb(26, 26, 46), text_size=size.small)
+    table.cell(t, 1, 0, "5min", text_color=color.yellow, bgcolor=color.rgb(26, 26, 46), text_size=size.small)
+    table.cell(t, 2, 0, "10min", text_color=color.blue, bgcolor=color.rgb(26, 26, 46), text_size=size.small)
+    table.cell(t, 3, 0, "合计", text_color=color.white, bgcolor=color.rgb(26, 26, 46), text_size=size.small)
+    table.cell(t, 4, 0, "方向", text_color=color.white, bgcolor=color.rgb(26, 26, 46), text_size=size.small)
+    table.cell(t, 5, 0, "RSI", text_color=color.white, bgcolor=color.rgb(26, 26, 46), text_size=size.small)
+
+    table.cell(t, 0, 1, "次数", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 1, str.tostring(t5), text_color=color.white, text_size=size.small)
+    table.cell(t, 2, 1, str.tostring(t10), text_color=color.white, text_size=size.small)
+    table.cell(t, 3, 1, str.tostring(t5 + t10), text_color=color.white, text_size=size.small)
+    table.cell(t, 4, 1, trend_up ? "上升" : trend_dn ? "下降" : "震荡", text_color=trend_up ? color.green : trend_dn ? color.red : color.gray, text_size=size.small)
+    table.cell(t, 5, 1, str.tostring(math.round(rsi, 1)), text_color=rsi > 70 ? color.red : rsi < 30 ? color.green : color.white, text_size=size.small)
+
+    table.cell(t, 0, 2, "胜率", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(wr5) + "%", text_color=wr5 >= 60 ? color.green : color.red, text_size=size.small)
+    table.cell(t, 2, 2, str.tostring(wr10) + "%", text_color=wr10 >= 60 ? color.green : color.red, text_size=size.small)
+    aw = (t5 + t10) > 0 ? math.round((w5 + w10) / (t5 + t10) * 100, 1) : 0
+    table.cell(t, 3, 2, str.tostring(aw) + "%", text_color=aw >= 60 ? color.green : color.red, text_size=size.small)
+    table.cell(t, 4, 2, bull_5min ? "5分涨" : "5分跌", text_color=bull_5min ? color.green : color.red, text_size=size.small)
+    table.cell(t, 5, 2, bull_15min ? "15分涨" : "15分跌", text_color=bull_15min ? color.green : color.red, text_size=size.small)
+
+    table.cell(t, 0, 3, "净盈亏", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 3, str.tostring(math.round(n5, 1)) + "U", text_color=n5 >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(t, 2, 3, str.tostring(math.round(n10, 1)) + "U", text_color=n10 >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(t, 3, 3, str.tostring(math.round(total_pnl, 1)) + "U", text_color=total_pnl >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(t, 4, 3, total_pnl >= 0 and (t5 + t10) > 0 ? "盈利" : (t5 + t10) > 0 ? "亏损" : "暂无", text_color=total_pnl >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(t, 6, 0, "信号", text_color=color.white, bgcolor=color.rgb(26, 26, 46), text_size=size.small)
+    table.cell(t, 6, 1, pullback_buy ? "做多" : bounce_sell ? "做空" : "等待", text_color=pullback_buy ? color.green : bounce_sell ? color.red : color.gray, text_size=size.small)
+
+// ========== 警报 (单个alert覆盖所有信号,免费版用) ==========
+if buy5
+    alert("BTC 5min做多 | 入场价: " + str.tostring(close), alert.freq_once_per_bar_close)
+if sell5
+    alert("BTC 5min做空 | 入场价: " + str.tostring(close), alert.freq_once_per_bar_close)
+if buy10
+    alert("BTC 10min做多 | 入场价: " + str.tostring(close), alert.freq_once_per_bar_close)
+if sell10
+    alert("BTC 10min做空 | 入场价: " + str.tostring(close), alert.freq_once_per_bar_close)

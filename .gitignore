@@ -1,0 +1,10 @@
+# 配置文件 (含API KEY和Webhook)
+config.ini
+
+# 交易记录
+trades.json
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
