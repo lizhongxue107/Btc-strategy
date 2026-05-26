@@ -542,12 +542,11 @@ def main_loop(bot: BTCAutoTrader, interval_sec=1):
             df = fetch_recent_klines(symbol=bot.symbol, interval=bot.interval, limit=200)
             if df is None:
                 bot.consecutive_errors += 1
-                if bot.consecutive_errors == 1:
-                    bot.alert_error("无法连接币安API, 正在重试...")
-                elif bot.consecutive_errors >= 30:
-                    if bot.consecutive_errors % 30 == 0:  # 每30次(30秒)提醒一次
-                        bot.alert_error(f"已断连 {bot.consecutive_errors} 秒")
-                time.sleep(5)
+                if bot.consecutive_errors == 60:  # 先自己重试1分钟, 实在连不上再告警
+                    bot.alert_error(f"币安API已断连60秒, 正在持续重试...")
+                elif bot.consecutive_errors > 60 and bot.consecutive_errors % 300 == 0:
+                    bot.alert_error(f"币安API仍不可用, 已断连 {bot.consecutive_errors//60} 分钟")
+                time.sleep(1)
                 continue
 
             # 连接恢复
