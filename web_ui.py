@@ -457,7 +457,7 @@ def api_data():
                     "side": t.side, "timeframe": t.timeframe,
                     "status": t.status, "pnl": round(t.pnl, 1),
                 }
-                for t in trade_history[-50:] if t.is_manual
+                for t in trade_history[-50:] if t.is_manual and t.status != "pending"
             ][::-1],
         })
 
@@ -528,7 +528,7 @@ def stream():
                         {"id": t.id, "time": t.time, "price": round(t.price, 1),
                          "side": t.side, "timeframe": t.timeframe,
                          "status": t.status, "pnl": round(t.pnl, 1)}
-                        for t in trade_history[-50:] if t.is_manual
+                        for t in trade_history[-50:] if t.is_manual and t.status != "pending"
                     ][::-1]
                     data = json.dumps({
                         "latest": latest,
@@ -924,14 +924,14 @@ function updateChart(records) {
             newMarkers.push({ time: r.time, position: 'aboveBar', color: '#cc00ff', shape: 'circle', text: '10min跌' });
         }
     });
-    // 手动单标记 (红色箭头)
+    // 手动单标记 (绿色方块)
     if (window._manualMarkers) {
         window._manualMarkers.forEach(m => {
             newMarkers.push({
                 time: m.time, position: m.side === 'up' ? 'belowBar' : 'aboveBar',
-                color: m.side === 'up' ? '#ff6b6b' : '#ff6b6b',
-                shape: m.side === 'up' ? 'arrowUp' : 'arrowDown',
-                text: '手动' + (m.side === 'up' ? '涨' : '跌') + ' ' + m.amount + 'U',
+                color: m.side === 'up' ? '#00ff88' : '#00ff88',
+                shape: 'square',
+                text: (m.side === 'up' ? '▲' : '▼') + m.amount + 'U @' + m.price,
             });
         });
     }
