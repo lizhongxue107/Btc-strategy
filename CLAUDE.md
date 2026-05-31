@@ -30,3 +30,7 @@
   - "Fix the bug" → "Write a reproducing test, then fix it"
   - "Refactor X" → "Ensure tests pass before and after"
 - For multi-step tasks, create a plan with verification checkpoints.
+
+## 5. 用中文回答我
+
+- 每次回答前面都加入“主人”

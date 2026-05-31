@@ -1,6 +1,6 @@
 """
 BTC 5min/10min 策略自动交易机器人
-v1.0 — 模拟/实盘双模式, Telegram通知
+v1.1 — 模拟/实盘双模式, 飞书通知, 事件合约自动下单
 策略: v6.2 趋势回踩策略
 
 使用:
@@ -14,6 +14,7 @@ import sys
 import os
 import json
 import time
+import pickle
 import threading
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, asdict
@@ -21,9 +22,13 @@ from enum import Enum
 from typing import Optional
 import configparser
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import pandas as pd
 import numpy as np
+
+MODEL_FILE = "ml_model.pkl"
 
 # ==============================
 # 1. 策略引擎 (复用回测逻辑)
@@ -68,8 +73,12 @@ def compute_indicators(df):
     df["ema21"] = ema(df["close"], 21)
     df["ema50"] = ema(df["close"], 50)
     df["rsi14"] = rsi(df["close"], 14)
-    _, _, df["macd_hist"] = macd(df["close"])
+    df["rsi6"] = rsi(df["close"], 6)
+    macd_l, macd_s, df["macd_hist"] = macd(df["close"])
+    df["macd_line"] = macd_l
+    df["macd_signal"] = macd_s
     df["vol_ma20"] = sma(df["volume"], 20)
+    df["atr14"] = atr(df["high"], df["low"], df["close"], 14)
 
     # 多时间框架
     df_5min = df.resample("5min").agg({"close": "last", "high": "max", "low": "min", "volume": "sum"})
@@ -102,11 +111,11 @@ def compute_indicators(df):
     df["macd_rising"] = df["macd_hist"] > df["macd_hist"].shift(1)
     df["macd_falling"] = df["macd_hist"] < df["macd_hist"].shift(1)
 
-    # 信号 (v6.2 最优参数硬编码)
+    # 信号 (v6.2 优化参数)
     bars_th = 3
-    rsi_buy_max = 55
+    rsi_buy_max = 50
     rsi_sell_min = 45
-    vol_min = 1.2
+    vol_min = 1.0
 
     df["pullback_buy"] = (
         df["trend_up"] &
@@ -130,23 +139,198 @@ def compute_indicators(df):
         df["macd_falling"]
     )
 
+    # 震荡市场反弹
+    df["range_here"] = ~df["trend_up"] & ~df["trend_dn"]
+    df["range_buy"] = (
+        df["range_here"] &
+        (df["bars_below"] >= 2) &
+        (df["close"] > df["ema8"]) &
+        (df["close"] > df["open"]) &
+        (df["volume"] > df["vol_ma20"] * vol_min) &
+        (df["rsi14"] > df["rsi14"].shift(1)) &
+        (df["rsi14"] < rsi_buy_max) &
+        df["macd_rising"]
+    )
+    df["range_sell"] = (
+        df["range_here"] &
+        (df["bars_above"] >= 2) &
+        (df["close"] < df["ema8"]) &
+        (df["close"] < df["open"]) &
+        (df["volume"] > df["vol_ma20"] * vol_min) &
+        (df["rsi14"] < df["rsi14"].shift(1)) &
+        (df["rsi14"] > rsi_sell_min) &
+        df["macd_falling"]
+    )
+
+    # 综合入场
+    df["buy_entry"] = df["pullback_buy"] | df["range_buy"]
+    df["sell_entry"] = df["bounce_sell"] | df["range_sell"]
+
+    # Pine Script 完整信号 (含多时间框架过滤, 无冷却)
+    df["buy5"] = df["buy_entry"] & df["bull_5min"]
+    df["sell5"] = df["sell_entry"] & ~df["bull_5min"]
+    df["buy10"] = df["pullback_buy"] & df["bull_5min"] & df["bull_15min"]
+    df["sell10"] = df["bounce_sell"] & ~df["bull_5min"] & ~df["bull_15min"]
+
+    return df
+
+
+def extend_ml_features(df):
+    """在原 compute_indicators 结果上添加 ML 模型需要的额外特征列."""
+    c = df["close"].values
+    h = df["high"].values
+    l = df["low"].values
+    o = df["open"].values
+    vol_col = "volume" if "volume" in df.columns else "vol"
+    v = df[vol_col].values
+    n = len(df)
+
+    df["above_ema8"] = c > df["ema8"].values
+
+    # RSI 方向
+    r14 = df["rsi14"].values
+    r6 = df["rsi6"].values
+    df["rsi14_rising"] = np.concatenate([[False], np.diff(r14) > 0])
+    df["rsi6_rising"] = np.concatenate([[False], np.diff(r6) > 0])
+    df["macd_above_signal"] = df["macd_line"].values > df["macd_signal"].values
+
+    # Volume SMA20 (vol_sma20 in backtest)
+    vol_sma20 = np.zeros(n)
+    for i in range(n):
+        vol_sma20[i] = np.mean(v[max(0, i - 19):i + 1])
+    df["vol_sma20"] = vol_sma20
+    df["vol_ratio"] = v / np.where(vol_sma20 == 0, 1, vol_sma20)
+
+    # MACD 别名 (模型用 macd, auto_trade 用 macd_line)
+    if "macd_line" in df.columns and "macd" not in df.columns:
+        df["macd"] = df["macd_line"]
+
+    # ATR (atr vs atr14 naming)
+    prev_close = np.concatenate([[c[0]], c[:-1]])
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_close), np.abs(l - prev_close)))
+    atr_arr = np.zeros(n)
+    atr_arr[0] = tr[0]
+    for i in range(1, n):
+        atr_arr[i] = (atr_arr[i - 1] * 13 + tr[i]) / 14
+    df["atr"] = atr_arr
+
+    # 动量特征
+    df["mom_3"] = np.concatenate([[0, 0], c[2:] - c[:-2]])
+    df["mom_5"] = np.concatenate([[0] * 4, c[4:] - c[:-4]])
+
+    # 连续 K 线计数
+    bull = c > o
+    bull_bars = np.zeros(n, dtype=np.int32)
+    bear_bars = np.zeros(n, dtype=np.int32)
+    for i in range(1, n):
+        if bull[i]:
+            bull_bars[i] = bull_bars[i - 1] + 1
+            bear_bars[i] = 0
+        else:
+            bear_bars[i] = bear_bars[i - 1] + 1
+            bull_bars[i] = 0
+    df["bull_bars"] = bull_bars
+    df["bear_bars"] = bear_bars
+
+    # K 线实体比例
+    hl = h - l
+    hl = np.where(hl == 0, 1, hl)
+    df["candle_body_ratio"] = (c - o) / hl
+
+    # 价格区间
+    high_5 = np.zeros(n)
+    low_5 = np.zeros(n)
+    for i in range(n):
+        high_5[i] = np.max(h[max(0, i - 4):i + 1])
+        low_5[i] = np.min(l[max(0, i - 4):i + 1])
+    df["high_5"] = high_5
+    df["low_5"] = low_5
+    hl5 = high_5 - low_5
+    hl5 = np.where(hl5 == 0, 1, hl5)
+    df["price_position_5"] = (c - low_5) / hl5
+
     return df
 
 
 # ==============================
-# 2. 数据获取
+# 2.5 ML Predictor
 # ==============================
+
+class MLPredictor:
+    """加载使用 RandomForest 模型做涨跌预测."""
+
+    def __init__(self, model_path=MODEL_FILE):
+        self.model_5 = None
+        self.model_10 = None
+        self.features = []
+        self.acc5 = 0
+        self.acc10 = 0
+        self.load(model_path)
+
+    def load(self, path):
+        if not os.path.exists(path):
+            print(f"[ML] 模型文件 {path} 不存在, 请先训练: python backtest_btc.py train")
+            return False
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+        self.model_5 = payload["model_5"]
+        self.model_10 = payload["model_10"]
+        self.features = payload["features"]
+        self.acc5 = payload.get("acc5", 0)
+        self.acc10 = payload.get("acc10", 0)
+        print(f"[ML] 模型已加载 (5min={self.acc5:.1%}, 10min={self.acc10:.1%}, {len(self.features)}特征)")
+        return True
+
+    def predict(self, df, conf_threshold=0.6):
+        """
+        对最新一根 K 线做预测, 返回 (pred_5: 1/0/None, prob_5, pred_10, prob_10).
+        None = 置信度不足, 不产生信号.
+        """
+        if self.model_5 is None:
+            return None, None, None, None
+
+        missing = [c for c in self.features if c not in df.columns]
+        if missing:
+            print(f"[ML] 缺少特征: {missing}")
+            return None, None, None, None
+
+        last = df[self.features].iloc[-1:].values.astype(np.float64)
+        if np.isnan(last).any():
+            return None, None, None, None
+
+        prob5 = self.model_5.predict_proba(last)[0][1]
+        prob10 = self.model_10.predict_proba(last)[0][1]
+
+        pred5 = 1 if prob5 >= conf_threshold else (0 if prob5 <= 1 - conf_threshold else None)
+        pred10 = 1 if prob10 >= conf_threshold else (0 if prob10 <= 1 - conf_threshold else None)
+
+        return pred5, prob5, pred10, prob10
 
 def fetch_recent_klines(symbol="BTCUSDT", interval="1m", limit=500):
     """获取最近limit根K线"""
-    url = "https://api.binance.com/api/v3/klines"
+    import ssl
+    # 处理 GFW 干扰: 创建自适应 SSL 上下文
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    urls = [
+        f"https://api.binance.com/api/v3/klines",
+        f"https://api1.binance.com/api/v3/klines",
+        f"https://api2.binance.com/api/v3/klines",
+        f"https://api3.binance.com/api/v3/klines",
+    ]
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        klines = resp.json()
-    except Exception as e:
-        print(f"[数据] 获取失败: {e}")
+    for url in urls:
+        try:
+            resp = requests.get(url, params=params, timeout=10, verify=False)
+            resp.raise_for_status()
+            klines = resp.json()
+            break
+        except Exception:
+            continue
+    else:
+        print(f"[数据] 获取失败 (所有端点)")
         return None
 
     df = pd.DataFrame(klines, columns=[
@@ -217,11 +401,12 @@ class Trade:
 # ==============================
 
 class BTCAutoTrader:
-    def __init__(self, paper_mode=True, bet=50, pr_rate=0.8, notifier=None):
+    def __init__(self, paper_mode=True, bet=50, pr_rate=0.8, notifier=None, hibt_bot=None):
         self.paper_mode = paper_mode
         self.bet = bet
         self.pr_rate = pr_rate
         self.notifier = notifier  # 飞书通知器
+        self._hibt_bot = hibt_bot
         self.symbol = "BTCUSDT"
         self.interval = "1m"
         self.start_time = datetime.now()
@@ -310,9 +495,9 @@ class BTCAutoTrader:
         # 检查信号
         signals = []
         if self.cooldown_5 == 0:
-            if latest["pullback_buy"] and latest["bull_5min"]:
+            if latest["buy_entry"] and latest["bull_5min"]:
                 signals.append(("5min", OrderSide.UP))
-            elif latest["bounce_sell"] and not latest["bull_5min"]:
+            elif latest["sell_entry"] and not latest["bull_5min"]:
                 signals.append(("5min", OrderSide.DOWN))
 
         if self.cooldown_10 == 0:
@@ -372,9 +557,31 @@ class BTCAutoTrader:
         self._save_trades()
 
     def _place_live_order(self, trade: Trade):
-        """实盘下单 (需要配置API KEY)"""
-        # TODO: 接入币安事件合约API
-        print(f"[实盘] 下单 #{trade.id}: {trade.timeframe} {'涨' if trade.side == OrderSide.UP else '跌'} 金额={trade.stake}U")
+        """实盘模式: 通过 Playwright 自动在 HIBT 事件合约下单"""
+        direction = "up" if trade.side == OrderSide.UP else "down"
+        duration = "5min" if trade.timeframe == "5min" else "10min"
+        print(f"[实盘] 浏览器下单: {direction} {trade.stake}U {duration}")
+
+        if not hasattr(self, '_hibt_bot') or self._hibt_bot is None:
+            print("[实盘] HIBT bot 未初始化, 请使用 --hibt-email 和 --hibt-password 参数")
+            return
+
+        try:
+            result = self._hibt_bot.place_bet(
+                direction=direction,
+                amount=trade.stake,
+                duration=duration,
+            )
+            if result.success:
+                print(f"[实盘] 下单成功!")
+                if self.notifier:
+                    self.notifier.send(f"🤖 自动下单成功: {'涨' if trade.side == OrderSide.UP else '跌'} {trade.stake}U {trade.timeframe}")
+            else:
+                print(f"[实盘] 下单失败: {result.message}")
+                if self.notifier:
+                    self.notifier.send(f"⚠️ 自动下单失败: {result.message}")
+        except Exception as e:
+            print(f"[实盘] 下单异常: {e}")
 
     def _settle_expired(self, current_price: float):
         """结算所有到期的挂单"""
@@ -443,14 +650,20 @@ class BTCAutoTrader:
         uptime_h = (datetime.now() - self.start_time).total_seconds() / 3600
         wr = wins / len(settled) * 100 if settled else 0
 
-        msg = (
-            f"💚 运行正常 | 已运行{uptime_h:.1f}h\n"
-            f"交易: {len(settled)}单 | 胜率: {wr:.1f}%\n"
-            f"盈亏: {total_pnl:+.1f}U | 挂单: {len(pending)}"
-        )
-        print(f"[心跳] {msg}")
+        lines = [
+            f"[OK] 运行{uptime_h:.1f}h",
+            f"交易{len(settled)}单 胜率{wr:.1f}%",
+            f"盈亏{total_pnl:+.1f}U 挂单{len(pending)}",
+        ]
+        msg_print = " | ".join(lines)
+        print(f"[心跳] {msg_print}")
         if self.notifier:
-            self.notifier.send(msg)
+            msg_notify = (
+                f"🤖 BTC {uptime_h:.1f}h\n"
+                f"交易: {len(settled)}单 | 胜率: {wr:.1f}%\n"
+                f"盈亏: {total_pnl:+.1f}U | 挂单: {len(pending)}"
+            )
+            self.notifier.send(msg_notify)
 
     def alert_error(self, err_msg: str):
         """连接异常时发飞书告警"""
@@ -460,20 +673,18 @@ class BTCAutoTrader:
         self.last_error_alert = now
         self.was_disconnected = True
 
-        msg = f"⚠️ 连接异常\n{err_msg}"
-        print(f"[告警] {msg}")
+        print(f"[告警] 连接异常: {err_msg}")
         if self.notifier:
-            self.notifier.send(msg)
+            self.notifier.send(f"⚠️ 连接异常\n{err_msg}")
 
     def alert_recovered(self):
         """连接恢复通知"""
         if not self.was_disconnected:
             return
         self.was_disconnected = False
-        msg = "✅ 连接已恢复, 正常运行中"
-        print(f"[恢复] {msg}")
+        print(f"[恢复] 连接已恢复, 正常运行中")
         if self.notifier:
-            self.notifier.send(msg)
+            self.notifier.send(f"[OK] 连接已恢复, 正常运行中")
 
     def print_summary(self):
         """打印完整统计"""
@@ -507,24 +718,75 @@ class BTCAutoTrader:
 
 
 # ==============================
+# 4.5 期货数据获取
+# ==============================
+
+FEISHU_HOOK_CACHE = None  # 飞书 webhook 用于独立通知
+
+
+def _fetch_futures_series(path, params, retries=3):
+    hosts = ["fapi.binance.com", "fapi1.binance.com", "fapi2.binance.com", "fapi3.binance.com"]
+    for host in hosts:
+        for _ in range(retries):
+            try:
+                r = requests.get(f"https://{host}{path}", params=params, timeout=10, verify=False)
+                if r.status_code == 200:
+                    return r.json()
+            except Exception:
+                continue
+    return []
+
+
+def fetch_futures_data_live(symbol="BTCUSDT", n_records=3):
+    """获取最新几笔期货数据, 返回 dict of latest values."""
+    result = {}
+    # Funding rate
+    raw = _fetch_futures_series("/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1})
+    if raw:
+        result["funding_rate"] = float(raw[-1]["fundingRate"])
+    # Open interest
+    raw = _fetch_futures_series("/futures/data/openInterestHist", {"symbol": symbol, "period": "5m", "limit": 2})
+    if raw and len(raw) >= 2:
+        result["open_interest"] = float(raw[-1]["sumOpenInterest"])
+        oi_prev = float(raw[-2]["sumOpenInterest"])
+        result["oi_change"] = (result["open_interest"] - oi_prev) / oi_prev if oi_prev else 0
+    # Taker ratio
+    raw = _fetch_futures_series("/futures/data/takerlongshortRatio", {"symbol": symbol, "period": "5m", "limit": 1})
+    if raw:
+        result["taker_buy_ratio"] = float(raw[-1]["buySellRatio"])
+    # LS ratio
+    raw = _fetch_futures_series("/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1})
+    if raw:
+        result["ls_ratio"] = float(raw[-1]["longShortRatio"])
+    return result
+
+
+def apply_futures_to_df(df, futures_dict):
+    """将最新期货数据填充到 df 最后一行."""
+    if not futures_dict:
+        return
+    for k, v in futures_dict.items():
+        if k not in df.columns:
+            df[k] = 0.0
+        df.loc[df.index[-1], k] = v
+
+
+# ==============================
 # 5. 主循环
 # ==============================
 
-def main_loop(bot: BTCAutoTrader, interval_sec=1):
-    """
-    主循环: 每interval_sec秒拉取K线, 检查新信号
-    - 策略基于收盘价, 每根1min K线收盘时检查信号
-    """
+def main_loop(bot: BTCAutoTrader, interval_sec=1, ml_predictor: MLPredictor = None):
     print(f"[主循环] 每{interval_sec}秒检查一次...")
     bot.running = True
-
     processed_bars = set()
+    futures_cache_time = 0
+    futures_cache = {}
 
-    # 启动时先处理已有的数据
     print("[启动] 加载历史数据...")
     df = fetch_recent_klines(symbol=bot.symbol, interval=bot.interval, limit=200)
     if df is not None and len(df) >= 100:
         df = compute_indicators(df)
+        df = extend_ml_features(df)
         for ts in df.index:
             processed_bars.add(ts)
         signals = bot.process_bar(df)
@@ -532,48 +794,65 @@ def main_loop(bot: BTCAutoTrader, interval_sec=1):
             print(f"[启动] 当前无信号, 等待新K线...")
         print(f"[启动] 就绪, 最新K线: {df.index[-1]} 收盘={df.iloc[-1]['close']:.2f}")
 
+    if ml_predictor:
+        futures_cache = fetch_futures_data_live()
+        futures_cache_time = time.time()
+
     try:
         while bot.running:
             time.sleep(interval_sec)
-
-            # 心跳
             bot.check_heartbeat()
 
             df = fetch_recent_klines(symbol=bot.symbol, interval=bot.interval, limit=200)
             if df is None:
                 bot.consecutive_errors += 1
-                if bot.consecutive_errors == 60:  # 先自己重试1分钟, 实在连不上再告警
-                    bot.alert_error(f"币安API已断连60秒, 正在持续重试...")
+                if bot.consecutive_errors == 60:
+                    bot.alert_error("币安API已断连60秒, 正在持续重试...")
                 elif bot.consecutive_errors > 60 and bot.consecutive_errors % 300 == 0:
                     bot.alert_error(f"币安API仍不可用, 已断连 {bot.consecutive_errors//60} 分钟")
                 time.sleep(1)
                 continue
 
-            # 连接恢复
             if bot.consecutive_errors > 0:
                 bot.consecutive_errors = 0
                 bot.alert_recovered()
             else:
                 bot.consecutive_errors = 0
 
-            # 检查是否有新K线
             latest_bar = df.index[-1]
-            if latest_bar not in processed_bars:
-                if len(df) >= 100:
-                    df = compute_indicators(df)
-                    signals = bot.process_bar(df)
-                    processed_bars.add(latest_bar)
-                    if signals:
-                        for tf, side in signals:
-                            d = "涨" if side == OrderSide.UP else "跌"
-                            print(f"  → 信号: {tf} {d}")
+            if latest_bar not in processed_bars and len(df) >= 100:
+                df = compute_indicators(df)
+                df = extend_ml_features(df)
 
-                # 清理已处理列表, 只保留最近200个
+                signals = bot.process_bar(df)
+
+                if ml_predictor:
+                    if time.time() - futures_cache_time > 60:
+                        futures_cache = fetch_futures_data_live()
+                        futures_cache_time = time.time()
+                    apply_futures_to_df(df, futures_cache)
+                    pred5, prob5, pred10, prob10 = ml_predictor.predict(df, conf_threshold=0.6)
+                    if pred5 is not None:
+                        direction = "涨" if pred5 == 1 else "跌"
+                        conf = max(prob5, 1 - prob5) * 100
+                        print(f"  [ML] 5min {direction} (conf={conf:.0f}%)")
+                        if bot.notifier:
+                            bot.notifier.send(f"[ML] BTC 5min {direction} {conf:.0f}%\n价格: {df.iloc[-1]['close']:.2f}\n时间: {latest_bar.strftime('%H:%M')}")
+                    if pred10 is not None:
+                        direction = "涨" if pred10 == 1 else "跌"
+                        conf = max(prob10, 1 - prob10) * 100
+                        print(f"  [ML] 10min {direction} (conf={conf:.0f}%)")
+                        if bot.notifier:
+                            bot.notifier.send(f"[ML] BTC 10min {direction} {conf:.0f}%\n价格: {df.iloc[-1]['close']:.2f}\n时间: {latest_bar.strftime('%H:%M')}")
+
+                processed_bars.add(latest_bar)
+                if signals:
+                    for tf, side in signals:
+                        d = "涨" if side == OrderSide.UP else "跌"
+                        print(f"  -> {tf} {d}")
+
                 if len(processed_bars) > 500:
                     processed_bars = set(sorted(processed_bars)[-200:])
-            else:
-                # 安静模式下不打印, 调试时取消注释
-                pass
 
     except KeyboardInterrupt:
         print("\n[停止] 用户中断")
@@ -620,7 +899,7 @@ class FeishuNotifier:
 
 
 # ==============================
-# 7. 入口
+# 8. 入口
 # ==============================
 
 def load_config():
@@ -659,16 +938,6 @@ def main():
     bet = float(config["TRADING"].get("bet", 50))
     pr_rate = float(config["TRADING"].get("payout_rate", 0.8))
 
-    # 实盘模式检查
-    if not paper_mode:
-        api_key = config["BINANCE"].get("api_key", "")
-        api_secret = config["BINANCE"].get("api_secret", "")
-        if not api_key or not api_secret:
-            print("[错误] 实盘模式需要填写 config.ini 中的 API KEY")
-            print("  1. 在币安创建API (开通交易权限)")
-            print("  2. 填入 config.ini [BINANCE] 字段")
-            return
-
     # 可选: 通知 (优先飞书, 其次Telegram)
     feishu_url = config["FEISHU"].get("webhook_url", "")
     tg_token = config["TELEGRAM"].get("bot_token", "")
@@ -684,17 +953,63 @@ def main():
         notifier = None
         print("[通知] 未配置, 仅终端输出")
 
-    bot = BTCAutoTrader(paper_mode=paper_mode, bet=bet, pr_rate=pr_rate, notifier=notifier)
+    # 实盘模式: 初始化浏览器自动化
+    hibt_bot = None
+    if not paper_mode:
+        hibt_email = config["HIBT_WEB"].get("email", "")
+        hibt_password = config["HIBT_WEB"].get("password", "")
+        headless = config["HIBT_WEB"].getboolean("headless", False)
+
+        if hibt_email and hibt_password:
+            print("[实盘] 初始化 HIBT 事件合约浏览器自动化...")
+            try:
+                from hibt_event_bot import HIBTEventBot
+                hibt_bot = HIBTEventBot(headless=headless)
+                hibt_bot.start()
+                if hibt_bot.login(hibt_email, hibt_password):
+                    print("[实盘] HIBT 登录成功, 准备自动下单")
+                    if notifier:
+                        notifier.send("🤖 HIBT 事件合约自动下单已就绪")
+                else:
+                    print("[实盘] HIBT 登录失败, 仅通知模式")
+                    hibt_bot = None
+            except Exception as e:
+                print(f"[实盘] HIBT bot 初始化失败: {e}")
+                print("[实盘] 回退到仅通知模式")
+                hibt_bot = None
+        else:
+            print("[实盘] 未配置 HIBT_WEB 账号密码, 仅通知模式")
+            print("[实盘] 请在 config.ini [HIBT_WEB] 中配置 email 和 password")
+
+        print("[实盘] 信号通知 + 浏览器自动下单")
+    else:
+        print("[模拟] 模式: 仅信号检测, 不实际下单")
+
+    bot = BTCAutoTrader(paper_mode=paper_mode, bet=bet, pr_rate=pr_rate,
+                        notifier=notifier, hibt_bot=hibt_bot)
+
+    # ML 预测器
+    ml_predictor = MLPredictor()
+    if not ml_predictor.model_5:
+        print("[ML] 模型未加载, 跳过 ML 预测")
+        ml_predictor = None
+    else:
+        print("[ML] ML 预测已启用 (置信度阈值 60%)")
 
     if notifier:
         notifier.send(f"BTC自动交易 {'模拟' if paper_mode else '实盘'} 已启动!")
 
     try:
-        main_loop(bot)
+        main_loop(bot, ml_predictor=ml_predictor)
     finally:
         if notifier:
             bot.print_summary()
             notifier.send("🤖 BTC自动交易已停止")
+        if hibt_bot:
+            try:
+                hibt_bot.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

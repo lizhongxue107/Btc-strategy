@@ -8,3 +8,30 @@ trades.json
 __pycache__/
 *.pyc
 *.pyo
+
+# 回测数据/模型
+btc_1m_data.pkl
+ml_model.pkl
+best_params.json
+cap.json
+
+# 浏览器测试数据
+.hibt_test_data/
+
+# Node.js
+node_modules/
+package-lock.json
+
+# 日志
+*.log
+
+# 运行脚本
+run_train.py
+
+# 图表/临时文件
+hibt_*.html
+hibt_*.json
+*.txt
+
+# 静态资源 (已从 npm 安装)
+static/
